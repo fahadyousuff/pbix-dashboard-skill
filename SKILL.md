@@ -22,13 +22,15 @@ A PBIX is a ZIP containing (among others):
 - `SecurityBindings` — a DPAPI-encrypted manifest signing the file layout.
 - `[Content_Types].xml` — lists every file in the ZIP.
 
-**Three gotchas that corrupt the file:**
+**Gotchas that corrupt the file (learn from scars):**
 
 1. **Python `zipfile` sets external file attributes that differ from .NET's `ZipArchive`.** Power BI validates them. Use .NET `ZipArchive` via PowerShell, with `ExternalAttributes = 0` on every entry.
 2. **Recompressing `DataModel` breaks it.** It must be stored with the **same compression method** as the source (usually `Deflate` but sometimes `Stored`); safest is `NoCompression` if you rewrote it, otherwise preserve the original bytes verbatim.
 3. **Adding any file breaks `SecurityBindings`.** It's a signed manifest of what's in the ZIP. If you add `Report/definition/pages/<new>/visuals/.../visual.json`, the signature no longer matches and PBI refuses to open.
+4. **Entry names must NOT have a leading `/`.** `MissingBIPackagePart: /Version` on open means your `Version` entry was zipped as `/Version` (leading slash). PowerShell's naive `Substring($src.Length + 1)` leaves a leading backslash → becomes `/` in the zip → PBI rejects. Compute the prefix from the resolved long path and `TrimStart('/')` every entry name.
+5. **UTF-8 BOM in `Report/definition/**/*.json` is fatal.** PBI error: `Only text with UTF8 encoding without BOM (byte order marks) is supported. Detected BOM: 'UTF-8'`. `Set-Content -Encoding UTF8` and `File.WriteAllText` without an explicit encoding BOTH write a BOM in Windows PowerShell 5.1 / .NET Framework. Always write JSON with `New-Object System.Text.UTF8Encoding($false)` passed to `WriteAllText` or `StreamWriter`.
 
-**The fix:** strip `SecurityBindings` from the ZIP **and** remove its entry from `[Content_Types].xml`. Power BI Desktop regenerates `SecurityBindings` on the next Save. The file opens cleanly.
+**The fix for SecurityBindings:** strip it from the ZIP **and** remove its entry from `[Content_Types].xml`. Power BI Desktop regenerates `SecurityBindings` on the next Save. The file opens cleanly.
 
 ## Procedure
 
@@ -98,9 +100,30 @@ Each page folder has a `page.json`:
 {"$schema":"...page/2.1.0/schema.json","name":"<pageId>","displayName":"Dashboard","displayOption":"FitToPage","height":1080,"width":1920}
 ```
 
-### 4. Repack — the ONLY reliable method
+### 4. Write JSON files — UTF-8 WITHOUT BOM
 
-Do NOT use Python `zipfile`. Use PowerShell with .NET `ZipArchive`:
+Every time you edit `visual.json`, `page.json`, `report.json`, or any file under `Report/definition/`, write it with no BOM. Windows PowerShell 5.1 adds a BOM by default.
+
+```powershell
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($path, $json, $utf8NoBom)
+```
+
+To strip a BOM already written by a previous mistake:
+```powershell
+$b = [System.IO.File]::ReadAllBytes($path)
+if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+    $text = [System.Text.Encoding]::UTF8.GetString($b, 3, $b.Length - 3)
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+```
+
+### 5. Repack — the ONLY reliable method
+
+Do NOT use Python `zipfile`. Use PowerShell with .NET `ZipArchive`. Key details:
+- Entry names use forward slashes and have NO leading `/`.
+- Compute the source prefix length from `(Get-Item $src).FullName.TrimEnd('\').Length + 1` (same casing/long-path form as `FullName` on Get-ChildItem items). `TrimStart('/')` every entry name as insurance.
+- Every text entry (including `[Content_Types].xml`) is written with a UTF-8 no-BOM `StreamWriter`.
 
 ```powershell
 Add-Type -AssemblyName System.IO.Compression
@@ -109,22 +132,26 @@ $src = "pbix_src"
 $dst = "Test_patched.pbix"
 if (Test-Path $dst) { Remove-Item $dst }
 
+$srcFull = (Get-Item $src).FullName.TrimEnd('\')
+$prefixLen = $srcFull.Length + 1
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
 $fs = [System.IO.File]::Open($dst, 'Create')
 $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
 
 Get-ChildItem $src -Recurse -File | ForEach-Object {
-    $rel = $_.FullName.Substring((Resolve-Path $src).Path.Length + 1).Replace('\','/')
+    $full = $_.FullName
+    $rel = $full.Substring($prefixLen).Replace('\','/').TrimStart('/')
 
     # STRIP SecurityBindings — PBI regenerates it on save
     if ($rel -eq 'SecurityBindings') { return }
 
     # Edit Content_Types.xml to drop the SecurityBindings reference
     if ($rel -eq '[Content_Types].xml') {
-        $xml = [System.IO.File]::ReadAllText($_.FullName)
-        $xml = $xml -replace '<Override[^/]*PartName="/SecurityBindings"[^/]*/>',''
+        $xml = [System.IO.File]::ReadAllText($full) -replace '<Override[^/]*PartName="/SecurityBindings"[^/]*/>',''
         $entry = $zip.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
         $entry.ExternalAttributes = 0
-        $sw = New-Object System.IO.StreamWriter($entry.Open())
+        $sw = New-Object System.IO.StreamWriter($entry.Open(), $utf8NoBom)
         $sw.Write($xml); $sw.Close()
         return
     }
@@ -139,22 +166,51 @@ Get-ChildItem $src -Recurse -File | ForEach-Object {
     $entry = $zip.CreateEntry($rel, $level)
     $entry.ExternalAttributes = 0   # critical — Python sets this to a non-zero value PBI rejects
     $es = $entry.Open()
-    $src_fs = [System.IO.File]::OpenRead($_.FullName)
-    $src_fs.CopyTo($es)
-    $src_fs.Close(); $es.Close()
+    $sfs = [System.IO.File]::OpenRead($full)
+    $sfs.CopyTo($es)
+    $sfs.Close(); $es.Close()
 }
 $zip.Dispose(); $fs.Close()
 ```
 
-### 5. Validate before opening
+### 6. Validate before opening
+
+Four checks, in order:
+
 ```powershell
-# Confirm SecurityBindings is gone, DataModel is intact
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $z = [System.IO.Compression.ZipFile]::OpenRead("Test_patched.pbix")
-$z.Entries | Where-Object { $_.FullName -match 'Security|DataModel' } | Select FullName, Length
+
+# a) Required parts present, SecurityBindings absent
+$z.Entries | Where-Object { $_.FullName -match '^(Version|DataModel|Metadata|Settings|SecurityBindings|\[Content_Types\]\.xml)$' } |
+    Select-Object FullName, Length
+
+# b) No entry has a leading '/'
+$z.Entries | Where-Object { $_.FullName.StartsWith('/') } | ForEach-Object { "BAD: $($_.FullName)" }
+
+# c) No BOM on any text metadata or Report/definition JSON
+foreach ($e in $z.Entries) {
+    if ($e.FullName -match '\.(json|xml)$|^Version$|^Metadata$|^Settings$') {
+        $s = $e.Open(); $ms = New-Object System.IO.MemoryStream; $s.CopyTo($ms); $s.Close()
+        $b = $ms.ToArray()
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+            Write-Host "BOM found: $($e.FullName)"
+        }
+    }
+}
+
+# d) Every Report/definition JSON parses
+foreach ($e in $z.Entries) {
+    if ($e.FullName -like 'Report/definition/*.json' -or $e.FullName -like 'Report/definition/**/*.json') {
+        $s = $e.Open(); $sr = New-Object System.IO.StreamReader($s)
+        $txt = $sr.ReadToEnd(); $sr.Close()
+        try { $null = $txt | ConvertFrom-Json } catch { "INVALID JSON: $($e.FullName) — $($_.Exception.Message)" }
+    }
+}
 $z.Dispose()
 ```
-Expect: `DataModel` present, `SecurityBindings` absent.
+
+Expect: `DataModel`, `Version`, `Metadata`, `Settings`, `[Content_Types].xml` present; `SecurityBindings` absent; no leading slashes; no BOMs; all JSON parses.
 
 ## Connecting to a live Power BI Desktop session (optional — for data discovery)
 
@@ -184,11 +240,134 @@ conn.Open()
 
 Use this only to **read schema and preview numbers**; final visuals are written as JSON files and repackaged above.
 
+## Styling visuals — the property names that actually work
+
+The formatting-pane labels in Power BI Desktop do NOT match the JSON property names. If you guess, PBI silently strips the bogus properties on next save — the file opens fine, but your style vanishes. Always build real changes in PBI once, save, extract, and copy the property names from the saved JSON.
+
+### Where styling lives in `visual.json`
+
+- `visual.visualContainerObjects` — the **outer frame** of the visual tile (background, border, drop shadow, title bar). Applies to every visual type.
+- `visual.objects` — the **inside** of the visual (plot area, axes, legend, data points, card value, card inner fill). Property names here are per-visual-type and must match the theme's `visualStyles[visualType]` schema.
+
+### Container frame (works for every visual)
+
+```json
+"visualContainerObjects": {
+  "background": [{"properties":{
+    "color":{"solid":{"color":{"expr":{"Literal":{"Value":"'#EEF2FF'"}}}}},
+    "transparency":{"expr":{"Literal":{"Value":"0D"}}}
+  }}],
+  "border": [{"properties":{
+    "show":{"expr":{"Literal":{"Value":"true"}}},
+    "color":{"solid":{"color":{"expr":{"Literal":{"Value":"'#E2E8F0'"}}}}},
+    "radius":{"expr":{"Literal":{"Value":"12D"}}}
+  }}],
+  "dropShadow": [{"properties":{
+    "show":{"expr":{"Literal":{"Value":"true"}}},
+    "color":{"solid":{"color":{"expr":{"Literal":{"Value":"'#0F172A'"}}}}},
+    "transparency":{"expr":{"Literal":{"Value":"85D"}}},
+    "position":{"expr":{"Literal":{"Value":"'Outer'"}}},
+    "preset":{"expr":{"Literal":{"Value":"'BottomRight'"}}}
+  }}]
+}
+```
+
+### cardVisual (KPI tile) — gotchas
+
+The big number is NOT `callout.color` and NOT `value.color`. PBI silently drops both.
+
+- Big number font color: `value.fontColor` (not `color`).
+- Big number font / size / weight: `value.fontFamily`, `value.fontSize`, `value.bold`.
+- Category label under the number: `label.fontColor`, `label.fontFamily`, `label.fontSize`.
+- Tinted fill behind the number: `cardCalloutArea.backgroundFillColor`, with a `selector` that names the metadata of the measure projection — e.g. `"selector":{"metadata":"Sum(financials.Profit)"}`. Read that string from `visual.query.queryState.Data.projections[0].queryRef`.
+
+```json
+"objects": {
+  "value": [{"properties":{
+    "fontColor":{"solid":{"color":{"expr":{"Literal":{"Value":"'#4F46E5'"}}}}},
+    "fontFamily":{"expr":{"Literal":{"Value":"'Segoe UI Semibold'"}}},
+    "fontSize":{"expr":{"Literal":{"Value":"40D"}}},
+    "bold":{"expr":{"Literal":{"Value":"true"}}}
+  }}],
+  "label": [{"properties":{
+    "fontColor":{"solid":{"color":{"expr":{"Literal":{"Value":"'#64748B'"}}}}}
+  }}],
+  "cardCalloutArea": [{
+    "properties": {
+      "show":{"expr":{"Literal":{"Value":"true"}}},
+      "backgroundFillColor":{"solid":{"color":{"expr":{"Literal":{"Value":"'#E0E7FF'"}}}}}
+    },
+    "selector":{"metadata":"Sum(financials.Sales)"}
+  }]
+}
+```
+
+### Bar / column / line / donut — data colors
+
+- `dataPoint.defaultColor` — the fallback color for all data points in a single-measure chart.
+- `dataPoint.showAllDataPoints: true` — enables per-datapoint overrides. On its own it does NOT auto-rotate the theme palette per category; PBI uses `dataColors[0]` for every bar unless you provide per-category selectors.
+- Per-category "rainbow" bars require a `dataPoint` entry per category value with a `selector.data[0].scopeId` that references that specific value. Constructing `scopeId` by hand is fragile — build it in PBI once, save, then copy the exact shape.
+- Multi-series charts (line with two years, donut with categories) DO rotate the theme palette automatically — so a custom theme palette gives them rainbow colors for free.
+
+### Custom report theme (vibrant palette, report-wide)
+
+Drop a theme file at `Report/StaticResources/RegisteredResources/<name>.json`:
+```json
+{
+  "name":"ModernVibrant",
+  "dataColors":["#6366F1","#EC4899","#10B981","#F59E0B","#06B6D4","#8B5CF6","#F43F5E","#84CC16","#0EA5E9","#D946EF"],
+  "background":"#FFFFFF","foreground":"#0F172A","tableAccent":"#6366F1",
+  "good":"#10B981","neutral":"#F59E0B","bad":"#F43F5E"
+}
+```
+
+Register in `Report/definition/report.json` by (a) appending a `resourcePackages` entry and (b) adding `themeCollection.customTheme`:
+```json
+"themeCollection": {
+  "baseTheme": { ...existing SharedResources Fluent2... },
+  "customTheme": {
+    "name":"ModernVibrant",
+    "reportVersionAtImport":{"visual":"2.12.0","report":"3.4.0","page":"2.3.1"},
+    "type":"RegisteredResources"
+  }
+},
+"resourcePackages": [
+  { ...existing SharedResources... },
+  {"name":"RegisteredResources","type":"RegisteredResources",
+   "items":[{"name":"ModernVibrant","path":"ModernVibrant.json","type":"CustomTheme"}]}
+]
+```
+`[Content_Types].xml` already has a `Default Extension="json"` so no entry needs to be added.
+
+### Page-level styling (`page.json`)
+
+```json
+"objects": {
+  "background": [{"properties":{
+    "color":{"solid":{"color":{"expr":{"Literal":{"Value":"'#F8FAFC'"}}}}},
+    "transparency":{"expr":{"Literal":{"Value":"0D"}}}
+  }}],
+  "outspace": [{"properties":{
+    "color":{"solid":{"color":{"expr":{"Literal":{"Value":"'#0F172A'"}}}}}
+  }}]
+}
+```
+
+### Discovering property names when PBI drops yours
+
+If your style vanishes on save:
+1. Open the patched pbix in PBI Desktop and set the property manually via the Format pane.
+2. Save, then re-extract the pbix and diff the visual JSON — the saved file shows the exact property name PBI expects.
+3. Clone that shape in your writer.
+
 ## Anti-patterns (things that will corrupt the file)
 - Python `zipfile.ZipFile(...)` repack → `ExternalAttributes` mismatch → "corrupted".
 - Recompressing `DataModel` → `MashupValidationError`.
 - Leaving `SecurityBindings` when you added any new file → "SecurityBindings invalid".
-- Guessing the `visual.json` schema → silent corruption. Always build real visuals in PBI once, inspect their JSON, then clone the shape.
+- Zip entries with a leading `/` (e.g. `/Version`) → `MissingBIPackagePart: /Version`.
+- UTF-8 BOM in any `Report/definition/**` JSON → `Only text with UTF8 encoding without BOM (byte order marks) is supported`.
+- `Set-Content -Encoding UTF8` and `[System.IO.File]::WriteAllText($p, $s)` without an explicit encoding on .NET Framework / PowerShell 5.1 → both write a BOM. Always pass `New-Object System.Text.UTF8Encoding($false)`.
+- Guessing the `visual.json` schema → silent corruption OR silently stripped properties. Always build real visuals in PBI once, inspect their JSON, then clone the shape.
 - `pbi-tools` v1.2.0 does NOT round-trip PBIR (it extracts Model/TMDL but skips `Report/definition/pages/*`). Don't use it for this.
 
 ## Quick sanity test
